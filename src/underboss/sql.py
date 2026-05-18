@@ -40,8 +40,15 @@ def insert_jobs(schema: str) -> str:
       "singletonKey",
       CASE
         WHEN "singletonSeconds" IS NOT NULL
-        THEN 'epoch'::timestamp + '1s'::interval * ("singletonSeconds" * floor(
-          (date_part('epoch', now()) + COALESCE("singletonOffset", 0)) / "singletonSeconds"))
+        -- Explicit float8 casts: CockroachDB will not implicitly mix float and
+        -- int operands inside floor()/division the way PostgreSQL does. The
+        -- bucket count is reduced to int8 before multiplying the interval.
+        THEN 'epoch'::timestamp + (
+          ("singletonSeconds" * floor(
+            (date_part('epoch', now()) + COALESCE("singletonOffset", 0)::float8)
+            / "singletonSeconds"::float8
+          )::int8) * interval '1 second'
+        )
         ELSE NULL
       END as singleton_on,
       "groupId" as group_id,
