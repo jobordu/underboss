@@ -254,27 +254,45 @@ class Underboss:
     # ----------------------------------------------------------------------
     # Producer / worker API — stubbed; implemented incrementally toward 0.1.0.
     # ----------------------------------------------------------------------
-    async def create_queue(self, name: str, options: QueueOptions | None = None) -> None:
-        """Create a queue, or do nothing if a queue with this name already exists."""
+    async def create_queue(
+        self,
+        name: str,
+        options: QueueOptions | None = None,
+        *,
+        connection: asyncpg.Connection | None = None,
+    ) -> None:
+        """Create a queue, or do nothing if a queue with this name already exists.
+
+        Pass ``connection`` to run inside a caller-supplied transaction.
+        """
         self._require_started()
         payload = _queue_options_payload(options or QueueOptions())
-        await self._db.execute(sql.create_queue(self._schema), name, payload)
+        await self._db.execute(
+            sql.create_queue(self._schema), name, payload, connection=connection
+        )
 
     async def send(
         self,
         name: str,
         data: Mapping[str, Any] | None = None,
         options: SendOptions | None = None,
+        *,
+        connection: asyncpg.Connection | None = None,
     ) -> str | None:
         """Enqueue a job on queue ``name``.
 
         Returns the new job's id, or ``None`` when a queue-policy index
-        suppressed it as a duplicate.
+        suppressed it as a duplicate. Pass ``connection`` to enqueue inside a
+        caller-supplied transaction — the job commits or rolls back with it.
         """
         self._require_started()
         payload = _job_payload(data, options or SendOptions())
-        row = await self._db.fetchrow(sql.insert_jobs(self._schema), [payload], name)
-        return None if row is None else str(row["id"])
+        # fetch (not fetchrow): fetchrow leaves a row-limited suspended portal,
+        # which CockroachDB rejects inside a transaction (crdb issue #40195).
+        rows = await self._db.fetch(
+            sql.insert_jobs(self._schema), [payload], name, connection=connection
+        )
+        return str(rows[0]["id"]) if rows else None
 
     async def work(
         self,
@@ -328,11 +346,18 @@ class Underboss:
             raise RuntimeError("scheduling is disabled on this Underboss instance")
         await self._scheduler.delete(name, key)
 
-    async def insert(self, name: str, jobs: list[JobInsert]) -> list[str]:
-        """Bulk-insert jobs into ``name``; returns the ids of jobs actually inserted."""
+    async def insert(
+        self, name: str, jobs: list[JobInsert], *, connection: asyncpg.Connection | None = None
+    ) -> list[str]:
+        """Bulk-insert jobs into ``name``; returns the ids of jobs actually inserted.
+
+        Pass ``connection`` to insert inside a caller-supplied transaction.
+        """
         self._require_started()
         payloads = [_job_insert_payload(job) for job in jobs]
-        rows = await self._db.fetch(sql.insert_jobs(self._schema), payloads, name)
+        rows = await self._db.fetch(
+            sql.insert_jobs(self._schema), payloads, name, connection=connection
+        )
         return [str(row["id"]) for row in rows]
 
     async def fetch(

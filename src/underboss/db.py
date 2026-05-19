@@ -67,14 +67,23 @@ class Database:
             await self._pool.close()
         self._pool = None
 
-    async def execute(self, sql: str, *args: Any) -> str:
-        return await self.pool.execute(sql, *args)
+    async def execute(
+        self, sql: str, *args: Any, connection: asyncpg.Connection | None = None
+    ) -> str:
+        target = connection if connection is not None else self.pool
+        return await target.execute(sql, *args)
 
-    async def fetch(self, sql: str, *args: Any) -> list[asyncpg.Record]:
-        return await self.pool.fetch(sql, *args)
+    async def fetch(
+        self, sql: str, *args: Any, connection: asyncpg.Connection | None = None
+    ) -> list[asyncpg.Record]:
+        target = connection if connection is not None else self.pool
+        return await target.fetch(sql, *args)
 
-    async def fetchrow(self, sql: str, *args: Any) -> asyncpg.Record | None:
-        return await self.pool.fetchrow(sql, *args)
+    async def fetchrow(
+        self, sql: str, *args: Any, connection: asyncpg.Connection | None = None
+    ) -> asyncpg.Record | None:
+        target = connection if connection is not None else self.pool
+        return await target.fetchrow(sql, *args)
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         return await self.pool.fetchval(sql, *args)
