@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
 import asyncpg
+
+
+async def _register_json_codecs(conn: asyncpg.Connection) -> None:
+    """Decode json/jsonb columns to Python objects, and encode them on the way in."""
+    for type_name in ("json", "jsonb"):
+        await conn.set_type_codec(
+            type_name,
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
 
 
 class Database:
@@ -46,6 +58,7 @@ class Database:
             self._dsn,
             min_size=self._min_size,
             max_size=self._max_size,
+            init=_register_json_codecs,
         )
 
     async def close(self) -> None:

@@ -94,3 +94,85 @@ def insert_jobs(schema: str) -> str:
     ON CONFLICT DO NOTHING
     RETURNING id
     """
+
+
+_JOB_COLUMNS_MIN = ("id", "name", "data", "expire_seconds", "group_id", "group_tier")
+_JOB_COLUMNS_META = ("state", "priority", "retry_limit", "retry_count", "started_on", "created_on")
+
+
+def fetch_next_job(schema: str, *, include_metadata: bool = False) -> str:
+    """Claim up to $2 jobs from queue $1 ($1 = queue name, $2 = batch size).
+
+    Ported from pg-boss ``fetchNextJob`` (standard-policy path). The claim is a
+    single auto-committed statement: the row lock is released the instant the
+    UPDATE commits, so executing a job never holds a database lock.
+    """
+    columns = _JOB_COLUMNS_MIN + (_JOB_COLUMNS_META if include_metadata else ())
+    returning = ", ".join(f"j.{column}" for column in columns)
+    return f"""
+    WITH next AS (
+      SELECT j.id
+      FROM {schema}.job j
+      WHERE j.name = $1
+        AND j.state < 'active'
+        AND j.start_after < now()
+      ORDER BY j.priority DESC, j.created_on, j.id
+      LIMIT $2
+      FOR UPDATE OF j SKIP LOCKED
+    )
+    UPDATE {schema}.job j SET
+      state = 'active',
+      started_on = now(),
+      heartbeat_on = now(),
+      retry_count = CASE WHEN j.started_on IS NOT NULL
+                         THEN j.retry_count + 1 ELSE j.retry_count END
+    FROM next
+    WHERE j.name = $1 AND j.id = next.id
+    RETURNING {returning}
+    """
+
+
+def complete_jobs(schema: str) -> str:
+    """Mark active jobs completed ($1 = queue, $2 = uuid[], $3 = output jsonb)."""
+    return f"""
+    UPDATE {schema}.job
+    SET completed_on = now(), state = 'completed', output = $3::jsonb
+    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'active'
+    """
+
+
+def fail_jobs(schema: str) -> str:
+    """Fail active jobs ($1 = queue, $2 = uuid[], $3 = error output jsonb).
+
+    A job with retries remaining moves back to ``retry`` with its next
+    ``start_after`` computed from ``retry_delay`` / ``retry_backoff``; an
+    exhausted job moves to ``failed``. ``retry_count`` is incremented at claim
+    time by :func:`fetch_next_job`, not here.
+
+    This is a plain UPDATE rather than pg-boss's delete-and-reinsert: that
+    pattern exists for table partitioning and dead-letter copying, neither of
+    which the single-table schema needs (dead-letter routing lands separately).
+    Numeric operands are cast to float8 explicitly — CockroachDB will not mix
+    float and int implicitly the way PostgreSQL does.
+    """
+    return f"""
+    UPDATE {schema}.job SET
+      state = CASE WHEN retry_count < retry_limit
+                   THEN 'retry'::{schema}.job_state
+                   ELSE 'failed'::{schema}.job_state END,
+      start_after = CASE
+        WHEN retry_count >= retry_limit THEN start_after
+        WHEN NOT retry_backoff THEN now() + retry_delay * interval '1 second'
+        ELSE now() + ((LEAST(
+          COALESCE(retry_delay_max::float8, 'infinity'::float8),
+          retry_delay::float8 * (
+            power(2::float8, LEAST(16, retry_count + 1)::float8) / 2::float8
+            + power(2::float8, LEAST(16, retry_count + 1)::float8) / 2::float8 * random()
+          )
+        ))::int8 * interval '1 second')
+      END,
+      completed_on = CASE WHEN retry_count < retry_limit THEN NULL ELSE now() END,
+      output = $3::jsonb,
+      heartbeat_on = NULL
+    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'active'
+    """

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import TracebackType
@@ -16,6 +15,7 @@ from underboss.db import Database
 from underboss.errors import MigrationRequiredError, NotStartedError
 from underboss.schema import DEFAULT_SCHEMA, SCHEMA_VERSION
 from underboss.types import QueueOptions, SendOptions, WorkHandler, WorkOptions
+from underboss.worker import Worker
 
 _PLANNED = "lands in a later wave on the way to 0.1.0"
 
@@ -114,6 +114,7 @@ class Underboss:
     ) -> None:
         self._schema = schema
         self._db = Database(dsn, pool=pool, min_size=min_pool_size, max_size=max_pool_size)
+        self._workers: dict[str, Worker] = {}
         self._started = False
 
     @property
@@ -134,7 +135,11 @@ class Underboss:
         return self
 
     async def stop(self) -> None:
-        """Close the connection pool (if underboss owns it)."""
+        """Stop every running worker, then close the connection pool."""
+        workers = list(self._workers.values())
+        self._workers.clear()
+        for worker in workers:
+            await worker.stop()
         await self._db.close()
         self._started = False
 
@@ -173,7 +178,7 @@ class Underboss:
         """Create a queue, or do nothing if a queue with this name already exists."""
         self._require_started()
         payload = _queue_options_payload(options or QueueOptions())
-        await self._db.execute(sql.create_queue(self._schema), name, json.dumps(payload))
+        await self._db.execute(sql.create_queue(self._schema), name, payload)
 
     async def send(
         self,
@@ -188,8 +193,7 @@ class Underboss:
         """
         self._require_started()
         payload = _job_payload(data, options or SendOptions())
-        jobs = json.dumps([payload])
-        row = await self._db.fetchrow(sql.insert_jobs(self._schema), jobs, name)
+        row = await self._db.fetchrow(sql.insert_jobs(self._schema), [payload], name)
         return None if row is None else str(row["id"])
 
     async def work(
@@ -198,9 +202,22 @@ class Underboss:
         handler: WorkHandler,
         options: WorkOptions | None = None,
     ) -> str:
-        """Start a worker that polls ``name`` and dispatches jobs to ``handler``."""
+        """Start a worker that polls ``name`` and dispatches jobs to ``handler``.
+
+        Returns the worker's id. The worker runs in the background until
+        :meth:`stop_worker` or :meth:`stop` is called.
+        """
         self._require_started()
-        raise NotImplementedError(f"work {_PLANNED}")
+        worker = Worker(self._db, self._schema, name, handler, options or WorkOptions())
+        worker.start()
+        self._workers[worker.id] = worker
+        return worker.id
+
+    async def stop_worker(self, worker_id: str) -> None:
+        """Stop a single worker by id."""
+        worker = self._workers.pop(worker_id, None)
+        if worker is not None:
+            await worker.stop()
 
     async def schedule(
         self,
