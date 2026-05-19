@@ -283,3 +283,58 @@ def try_set_cron_time(schema: str) -> str:
     WHERE EXTRACT(EPOCH FROM (now() - COALESCE(cron_on, now() - interval '1 week')))::float8 > $1
     RETURNING true
     """
+
+
+def get_job_by_id(schema: str) -> str:
+    """A single job by id ($1 = queue, $2 = job id)."""
+    columns = ", ".join(_JOB_COLUMNS_MIN + _JOB_COLUMNS_META)
+    return f"SELECT {columns} FROM {schema}.job WHERE name = $1 AND id = $2::uuid"
+
+
+def cancel_jobs(schema: str) -> str:
+    """Cancel queued or active jobs ($1 = queue, $2 = uuid[])."""
+    return f"""
+    UPDATE {schema}.job
+    SET completed_on = now(), state = 'cancelled'
+    WHERE name = $1 AND id = ANY($2::uuid[]) AND state < 'completed'
+    """
+
+
+def resume_jobs(schema: str) -> str:
+    """Return cancelled jobs to the queue ($1 = queue, $2 = uuid[])."""
+    return f"""
+    UPDATE {schema}.job
+    SET completed_on = NULL, state = 'created'
+    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'cancelled'
+    """
+
+
+def retry_jobs(schema: str) -> str:
+    """Re-queue failed jobs, lifting their retry limit ($1 = queue, $2 = uuid[])."""
+    return f"""
+    UPDATE {schema}.job
+    SET state = 'retry', retry_limit = retry_limit + 1
+    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'failed'
+    """
+
+
+def delete_jobs(schema: str) -> str:
+    """Delete jobs by id ($1 = queue, $2 = uuid[])."""
+    return f"DELETE FROM {schema}.job WHERE name = $1 AND id = ANY($2::uuid[])"
+
+
+_QUEUE_COLUMNS = (
+    "name", "policy", "retry_limit", "retry_delay", "retry_backoff", "retry_delay_max",
+    "expire_seconds", "retention_seconds", "deletion_seconds", "dead_letter",
+    "warning_queued", "heartbeat_seconds",
+)
+
+
+def get_queue(schema: str) -> str:
+    """A single queue's configuration by name ($1 = name)."""
+    return f"SELECT {', '.join(_QUEUE_COLUMNS)} FROM {schema}.queue WHERE name = $1"
+
+
+def get_queues(schema: str) -> str:
+    """Every queue's configuration, ordered by name."""
+    return f"SELECT {', '.join(_QUEUE_COLUMNS)} FROM {schema}.queue ORDER BY name"

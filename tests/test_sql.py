@@ -52,3 +52,13 @@ def test_route_to_dead_letter_inserts_into_the_target_queue() -> None:
     assert "INSERT INTO underboss.job" in query
     assert "FROM underboss.queue q" in query
     assert "WHERE q.name = $1" in query
+
+
+def test_admin_sql_builders_target_the_schema() -> None:
+    assert "FROM underboss.job" in sql.get_job_by_id("underboss")
+    assert "state = 'cancelled'" in sql.cancel_jobs("underboss")
+    assert "state = 'created'" in sql.resume_jobs("underboss")
+    assert "retry_limit = retry_limit + 1" in sql.retry_jobs("underboss")
+    assert sql.delete_jobs("underboss").startswith("DELETE FROM underboss.job")
+    assert "FROM underboss.queue WHERE name = $1" in sql.get_queue("underboss")
+    assert "FROM underboss.queue ORDER BY name" in sql.get_queues("underboss")

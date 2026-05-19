@@ -16,8 +16,17 @@ from underboss.errors import MigrationRequiredError, NotStartedError
 from underboss.maintenance import Maintenance
 from underboss.scheduler import Scheduler
 from underboss.schema import DEFAULT_SCHEMA, SCHEMA_VERSION
-from underboss.types import QueueOptions, SendOptions, WorkHandler, WorkOptions
-from underboss.worker import Worker
+from underboss.types import (
+    Job,
+    JobInsert,
+    Queue,
+    QueueOptions,
+    QueuePolicy,
+    SendOptions,
+    WorkHandler,
+    WorkOptions,
+)
+from underboss.worker import Worker, _row_to_job
 
 
 def _isoformat_z(value: datetime) -> str:
@@ -88,6 +97,51 @@ def _job_payload(data: Mapping[str, Any] | None, options: SendOptions) -> dict[s
     if options.expire_in_seconds is not None:
         payload["expireInSeconds"] = options.expire_in_seconds
     return payload
+
+
+def _job_insert_payload(job: JobInsert) -> dict[str, Any]:
+    """Translate a :class:`JobInsert` into the insert query's job spec."""
+    payload: dict[str, Any] = {"priority": job.priority}
+    if job.id is not None:
+        payload["id"] = job.id
+    if job.data is not None:
+        payload["data"] = job.data
+    start_after = _encode_start_after(job.start_after)
+    if start_after is not None:
+        payload["startAfter"] = start_after
+    if job.singleton_key is not None:
+        payload["singletonKey"] = job.singleton_key
+    if job.dead_letter is not None:
+        payload["deadLetter"] = job.dead_letter
+    if job.retry_limit is not None:
+        payload["retryLimit"] = job.retry_limit
+    if job.retry_delay is not None:
+        payload["retryDelay"] = job.retry_delay
+    if job.retry_backoff is not None:
+        payload["retryBackoff"] = job.retry_backoff
+    if job.expire_in_seconds is not None:
+        payload["expireInSeconds"] = job.expire_in_seconds
+    return payload
+
+
+def _row_to_queue(row: Any) -> Queue:
+    """Build a :class:`Queue` from a fetched ``queue`` row."""
+    return Queue(
+        name=row["name"],
+        options=QueueOptions(
+            policy=QueuePolicy(row["policy"]),
+            retry_limit=row["retry_limit"],
+            retry_delay=row["retry_delay"],
+            retry_backoff=row["retry_backoff"],
+            retry_delay_max=row["retry_delay_max"],
+            expire_in_seconds=row["expire_seconds"],
+            retention_seconds=row["retention_seconds"],
+            delete_after_seconds=row["deletion_seconds"],
+            dead_letter=row["dead_letter"],
+            warning_queue_size=row["warning_queued"],
+            heartbeat_seconds=row["heartbeat_seconds"],
+        ),
+    )
 
 
 class Underboss:
@@ -269,3 +323,64 @@ class Underboss:
         if self._scheduler is None:
             raise RuntimeError("scheduling is disabled on this Underboss instance")
         await self._scheduler.delete(name, key)
+
+    async def insert(self, name: str, jobs: list[JobInsert]) -> list[str]:
+        """Bulk-insert jobs into ``name``; returns the ids of jobs actually inserted."""
+        self._require_started()
+        payloads = [_job_insert_payload(job) for job in jobs]
+        rows = await self._db.fetch(sql.insert_jobs(self._schema), payloads, name)
+        return [str(row["id"]) for row in rows]
+
+    async def fetch(
+        self, name: str, *, batch_size: int = 1, include_metadata: bool = False
+    ) -> list[Job]:
+        """Claim up to ``batch_size`` jobs from ``name`` without running a worker."""
+        self._require_started()
+        query = sql.fetch_next_job(self._schema, include_metadata=include_metadata)
+        rows = await self._db.fetch(query, name, batch_size)
+        return [_row_to_job(row, include_metadata=include_metadata) for row in rows]
+
+    async def get_job(self, name: str, job_id: str) -> Job | None:
+        """Return a job by id, or ``None`` if it does not exist."""
+        self._require_started()
+        row = await self._db.fetchrow(sql.get_job_by_id(self._schema), name, job_id)
+        return None if row is None else _row_to_job(row, include_metadata=True)
+
+    async def complete(
+        self, name: str, job_id: str, output: Mapping[str, Any] | None = None
+    ) -> None:
+        """Mark a job completed."""
+        self._require_started()
+        await self._db.execute(sql.complete_jobs(self._schema), name, [job_id], output)
+
+    async def cancel(self, name: str, job_id: str) -> None:
+        """Cancel a queued or active job."""
+        self._require_started()
+        await self._db.execute(sql.cancel_jobs(self._schema), name, [job_id])
+
+    async def resume(self, name: str, job_id: str) -> None:
+        """Return a cancelled job to its queue."""
+        self._require_started()
+        await self._db.execute(sql.resume_jobs(self._schema), name, [job_id])
+
+    async def retry(self, name: str, job_id: str) -> None:
+        """Re-queue a failed job."""
+        self._require_started()
+        await self._db.execute(sql.retry_jobs(self._schema), name, [job_id])
+
+    async def delete_job(self, name: str, job_id: str) -> None:
+        """Delete a job by id."""
+        self._require_started()
+        await self._db.execute(sql.delete_jobs(self._schema), name, [job_id])
+
+    async def get_queue(self, name: str) -> Queue | None:
+        """Return a queue's configuration, or ``None`` if it does not exist."""
+        self._require_started()
+        row = await self._db.fetchrow(sql.get_queue(self._schema), name)
+        return None if row is None else _row_to_queue(row)
+
+    async def get_queues(self) -> list[Queue]:
+        """Return every queue's configuration."""
+        self._require_started()
+        rows = await self._db.fetch(sql.get_queues(self._schema))
+        return [_row_to_queue(row) for row in rows]
