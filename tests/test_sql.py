@@ -39,3 +39,16 @@ def test_delete_old_jobs_removes_completed_and_stale_jobs() -> None:
     assert query.strip().startswith("DELETE FROM underboss.job")
     assert "deletion_seconds" in query
     assert "keep_until" in query
+
+
+def test_fail_jobs_returns_dead_letter_routing_info() -> None:
+    query = sql.fail_jobs("underboss")
+    assert "UPDATE underboss.job" in query
+    assert "RETURNING dead_letter, data, output, state" in query
+
+
+def test_route_to_dead_letter_inserts_into_the_target_queue() -> None:
+    query = sql.route_to_dead_letter("underboss")
+    assert "INSERT INTO underboss.job" in query
+    assert "FROM underboss.queue q" in query
+    assert "WHERE q.name = $1" in query

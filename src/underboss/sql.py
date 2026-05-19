@@ -178,24 +178,25 @@ def _retry_or_fail_set(schema: str, output: str) -> str:
 def fail_jobs(schema: str) -> str:
     """Fail active jobs by id ($1 = queue, $2 = uuid[], $3 = error output jsonb).
 
-    A plain UPDATE rather than pg-boss's delete-and-reinsert: that pattern
-    exists for table partitioning and dead-letter copying, neither of which the
-    single-table schema needs (dead-letter routing lands separately).
+    Moves each job to ``retry`` or ``failed`` and RETURNs its dead_letter / data
+    / output / state, so the caller can route exhausted jobs to a dead-letter
+    queue with :func:`route_to_dead_letter` — a separate statement, because
+    CockroachDB rejects two mutations of one table in a single statement.
     """
     set_clause = _retry_or_fail_set(schema, "$3::jsonb")
     return f"""
     UPDATE {schema}.job SET
     {set_clause}
     WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'active'
+    RETURNING dead_letter, data, output, state
     """
 
 
 def fail_expired_jobs(schema: str) -> str:
     """Fail every active job whose lease has expired (started_on + expire_seconds).
 
-    The timeout sweep — how jobs are recovered from a worker that died mid-run.
-    Like :func:`fail_jobs`, an expired job with retries left returns to
-    ``retry``; an exhausted one moves to ``failed``.
+    The timeout sweep. RETURNs dead_letter / data / output / state for
+    dead-letter routing, like :func:`fail_jobs`.
     """
     timed_out = "'{\"message\": \"job timed out\"}'::jsonb"
     set_clause = _retry_or_fail_set(schema, timed_out)
@@ -204,6 +205,29 @@ def fail_expired_jobs(schema: str) -> str:
     {set_clause}
     WHERE state = 'active'
       AND started_on + expire_seconds * interval '1 second' < now()
+    RETURNING dead_letter, data, output, state
+    """
+
+
+def route_to_dead_letter(schema: str) -> str:
+    """Copy a failed job into its dead-letter queue ($1 = DLQ, $2 = data, $3 = output).
+
+    Inserts a fresh job into the dead-letter queue carrying the failed job's
+    payload and failure output, with the DLQ's own retry / retention config.
+    Ported from pg-boss ``failJobs`` (the dlq_jobs CTE), run as its own
+    statement so it never shares a statement with the failure UPDATE.
+    """
+    return f"""
+    INSERT INTO {schema}.job (
+      name, data, output, retry_limit, retry_delay, retry_backoff,
+      keep_until, deletion_seconds
+    )
+    SELECT
+      q.name, $2::jsonb, $3::jsonb,
+      q.retry_limit, q.retry_delay, q.retry_backoff,
+      now() + q.retention_seconds * interval '1 second', q.deletion_seconds
+    FROM {schema}.queue q
+    WHERE q.name = $1
     """
 
 

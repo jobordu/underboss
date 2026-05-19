@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
-from underboss import sql
+from underboss import failure, sql
 from underboss.db import Database
 from underboss.types import Job, JobState, WorkHandler, WorkOptions
 
@@ -65,11 +65,11 @@ class Worker:
         self.id = str(uuid4())
         self.name = name
         self._db = db
+        self._schema = schema
         self._handler = handler
         self._options = options
         self._fetch_sql = sql.fetch_next_job(schema, include_metadata=options.include_metadata)
         self._complete_sql = sql.complete_jobs(schema)
-        self._fail_sql = sql.fail_jobs(schema)
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._wake = asyncio.Event()
@@ -128,18 +128,22 @@ class Worker:
             result = await self._handler(jobs)
         except Exception as exc:  # any handler error fails the whole batch
             _log.exception("underboss worker for %r: handler raised", self.name)
-            await self._settle(
-                self._fail_sql, ids, {"message": str(exc), "type": type(exc).__name__}
-            )
+            await self._fail(ids, {"message": str(exc), "type": type(exc).__name__})
         else:
             output = result if isinstance(result, Mapping) else None
-            await self._settle(self._complete_sql, ids, output)
+            await self._complete(ids, output)
 
-    async def _settle(self, query: str, ids: list[Any], output: Any) -> None:
+    async def _complete(self, ids: list[Any], output: Any) -> None:
         try:
-            await self._db.execute(query, self.name, ids, output)
+            await self._db.execute(self._complete_sql, self.name, ids, output)
         except Exception:
-            _log.exception("underboss worker for %r: settling batch failed", self.name)
+            _log.exception("underboss worker for %r: completing batch failed", self.name)
+
+    async def _fail(self, ids: list[Any], output: dict[str, Any]) -> None:
+        try:
+            await failure.fail_by_id(self._db, self._schema, self.name, ids, output)
+        except Exception:
+            _log.exception("underboss worker for %r: failing batch failed", self.name)
 
     async def _idle(self, seconds: float) -> None:
         """Sleep up to ``seconds``, waking early on a stop or a notify().

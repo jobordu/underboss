@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import logging
 
-from underboss import sql
+from underboss import failure, sql
 from underboss.db import Database
 
 _log = logging.getLogger("underboss.maintenance")
@@ -24,8 +24,8 @@ class Maintenance:
 
     def __init__(self, db: Database, schema: str, *, interval_seconds: float = 60.0) -> None:
         self._db = db
+        self._schema = schema
         self._interval = interval_seconds
-        self._timeout_sql = sql.fail_expired_jobs(schema)
         self._deletion_sql = sql.delete_old_jobs(schema)
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
@@ -48,7 +48,7 @@ class Maintenance:
 
     async def sweep(self) -> None:
         """Run both maintenance sweeps once."""
-        await self._db.execute(self._timeout_sql)
+        await failure.fail_expired(self._db, self._schema)
         await self._db.execute(self._deletion_sql)
 
     async def _run(self) -> None:
