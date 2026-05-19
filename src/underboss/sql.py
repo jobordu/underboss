@@ -176,3 +176,44 @@ def fail_jobs(schema: str) -> str:
       heartbeat_on = NULL
     WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'active'
     """
+
+
+def get_schedules(schema: str) -> str:
+    """All cron schedules, ordered by queue and key."""
+    return (
+        f"SELECT name, key, cron, timezone, data, options "
+        f"FROM {schema}.schedule ORDER BY name, key"
+    )
+
+
+def upsert_schedule(schema: str) -> str:
+    """Create or replace a schedule ($1=name, $2=key, $3=cron, $4=tz, $5=data, $6=options)."""
+    return f"""
+    INSERT INTO {schema}.schedule (name, key, cron, timezone, data, options)
+    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+    ON CONFLICT (name, key) DO UPDATE SET
+      cron = EXCLUDED.cron,
+      timezone = EXCLUDED.timezone,
+      data = EXCLUDED.data,
+      options = EXCLUDED.options,
+      updated_on = now()
+    """
+
+
+def delete_schedule(schema: str) -> str:
+    """Remove a schedule ($1 = queue name, $2 = key)."""
+    return f"DELETE FROM {schema}.schedule WHERE name = $1 AND COALESCE(key, '') = $2"
+
+
+def try_set_cron_time(schema: str) -> str:
+    """Claim the cron tick when $1 seconds have elapsed since the last one.
+
+    Returns one row when this caller won the tick, and no rows otherwise — this
+    debounces the cron clock across multiple nodes via ``version.cron_on``.
+    """
+    return f"""
+    UPDATE {schema}.version
+    SET cron_on = now()
+    WHERE EXTRACT(EPOCH FROM (now() - COALESCE(cron_on, now() - interval '1 week')))::float8 > $1
+    RETURNING true
+    """

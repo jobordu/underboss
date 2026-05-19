@@ -13,11 +13,10 @@ from underboss import schema as ddl
 from underboss import sql
 from underboss.db import Database
 from underboss.errors import MigrationRequiredError, NotStartedError
+from underboss.scheduler import Scheduler
 from underboss.schema import DEFAULT_SCHEMA, SCHEMA_VERSION
 from underboss.types import QueueOptions, SendOptions, WorkHandler, WorkOptions
 from underboss.worker import Worker
-
-_PLANNED = "lands in a later wave on the way to 0.1.0"
 
 
 def _isoformat_z(value: datetime) -> str:
@@ -111,10 +110,17 @@ class Underboss:
         schema: str = DEFAULT_SCHEMA,
         min_pool_size: int = 2,
         max_pool_size: int = 10,
+        scheduling: bool = True,
+        cron_interval_seconds: float = 60.0,
     ) -> None:
         self._schema = schema
         self._db = Database(dsn, pool=pool, min_size=min_pool_size, max_size=max_pool_size)
         self._workers: dict[str, Worker] = {}
+        self._scheduler: Scheduler | None = (
+            Scheduler(self._db, schema, self.send, tick_interval_seconds=cron_interval_seconds)
+            if scheduling
+            else None
+        )
         self._started = False
 
     @property
@@ -128,14 +134,18 @@ class Underboss:
         return self._started
 
     async def start(self) -> Underboss:
-        """Open the connection pool and install the schema if it is absent."""
+        """Open the connection pool, install the schema, and start the scheduler."""
         await self._db.open()
         await self._provision()
         self._started = True
+        if self._scheduler is not None:
+            await self._scheduler.start()
         return self
 
     async def stop(self) -> None:
-        """Stop every running worker, then close the connection pool."""
+        """Stop the scheduler and every worker, then close the connection pool."""
+        if self._scheduler is not None:
+            await self._scheduler.stop()
         workers = list(self._workers.values())
         self._workers.clear()
         for worker in workers:
@@ -230,4 +240,13 @@ class Underboss:
     ) -> None:
         """Attach a cron schedule to a queue."""
         self._require_started()
-        raise NotImplementedError(f"schedule {_PLANNED}")
+        if self._scheduler is None:
+            raise RuntimeError("scheduling is disabled on this Underboss instance")
+        await self._scheduler.upsert(name, key, cron, timezone, data)
+
+    async def unschedule(self, name: str, key: str = "") -> None:
+        """Remove a cron schedule from a queue."""
+        self._require_started()
+        if self._scheduler is None:
+            raise RuntimeError("scheduling is disabled on this Underboss instance")
+        await self._scheduler.delete(name, key)
