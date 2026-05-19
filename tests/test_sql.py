@@ -54,6 +54,15 @@ def test_route_to_dead_letter_inserts_into_the_target_queue() -> None:
     assert "WHERE q.name = $1" in query
 
 
+def test_fetch_next_job_has_a_group_concurrency_variant() -> None:
+    plain = sql.fetch_next_job("underboss")
+    grouped = sql.fetch_next_job("underboss", group_concurrency=3)
+    assert "active_group_counts" not in plain
+    assert "active_group_counts" in grouped
+    assert "ROW_NUMBER() OVER (PARTITION BY t.group_id" in grouped
+    assert "(active_cnt + group_rn) <= $3" in grouped
+
+
 def test_admin_sql_builders_target_the_schema() -> None:
     assert "FROM underboss.job" in sql.get_job_by_id("underboss")
     assert "state = 'cancelled'" in sql.cancel_jobs("underboss")

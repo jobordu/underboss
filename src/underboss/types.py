@@ -114,6 +114,7 @@ class JobInsert:
     expire_in_seconds: int | None = None
     keep_until: datetime | int | str | None = None
     dead_letter: str | None = None
+    group: GroupOptions | None = None
 
 
 @dataclass(slots=True)
@@ -125,6 +126,9 @@ class WorkOptions:
     include_metadata: bool = False
     priority: bool = True
     local_concurrency: int = 1
+    #: Cap on how many jobs per ``group_id`` may be active at once, across all
+    #: nodes (enforced in the fetch query). ``None`` disables the cap.
+    group_concurrency: int | None = None
 
 
 @dataclass(slots=True)

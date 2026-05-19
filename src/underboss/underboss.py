@@ -121,6 +121,10 @@ def _job_insert_payload(job: JobInsert) -> dict[str, Any]:
         payload["retryBackoff"] = job.retry_backoff
     if job.expire_in_seconds is not None:
         payload["expireInSeconds"] = job.expire_in_seconds
+    if job.group is not None:
+        payload["groupId"] = job.group.id
+        if job.group.tier is not None:
+            payload["groupTier"] = job.group.tier
     return payload
 
 
@@ -332,12 +336,27 @@ class Underboss:
         return [str(row["id"]) for row in rows]
 
     async def fetch(
-        self, name: str, *, batch_size: int = 1, include_metadata: bool = False
+        self,
+        name: str,
+        *,
+        batch_size: int = 1,
+        include_metadata: bool = False,
+        group_concurrency: int | None = None,
     ) -> list[Job]:
-        """Claim up to ``batch_size`` jobs from ``name`` without running a worker."""
+        """Claim up to ``batch_size`` jobs from ``name`` without running a worker.
+
+        With ``group_concurrency``, at most that many jobs per ``group_id`` are
+        claimed across all jobs already active.
+        """
         self._require_started()
-        query = sql.fetch_next_job(self._schema, include_metadata=include_metadata)
-        rows = await self._db.fetch(query, name, batch_size)
+        query = sql.fetch_next_job(
+            self._schema, include_metadata=include_metadata, group_concurrency=group_concurrency
+        )
+        if group_concurrency is None:
+            args: tuple[Any, ...] = (name, batch_size)
+        else:
+            args = (name, batch_size, group_concurrency)
+        rows = await self._db.fetch(query, *args)
         return [_row_to_job(row, include_metadata=include_metadata) for row in rows]
 
     async def get_job(self, name: str, job_id: str) -> Job | None:

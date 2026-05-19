@@ -100,24 +100,29 @@ _JOB_COLUMNS_MIN = ("id", "name", "data", "expire_seconds", "group_id", "group_t
 _JOB_COLUMNS_META = ("state", "priority", "retry_limit", "retry_count", "started_on", "created_on")
 
 
-def fetch_next_job(schema: str, *, include_metadata: bool = False) -> str:
-    """Claim up to $2 jobs from queue $1 ($1 = queue name, $2 = batch size).
+def fetch_next_job(
+    schema: str, *, include_metadata: bool = False, group_concurrency: int | None = None
+) -> str:
+    """Claim jobs from queue $1 ($1 = queue, $2 = batch size, $3 = group limit).
 
-    Ported from pg-boss ``fetchNextJob`` (standard-policy path). The claim is a
-    single auto-committed statement: the row lock is released the instant the
-    UPDATE commits, so executing a job never holds a database lock.
+    Ported from pg-boss ``fetchNextJob``. The claim is a single auto-committed
+    statement: the row lock is released the instant the UPDATE commits, so
+    executing a job never holds a database lock. When ``group_concurrency`` is
+    set, $3 caps how many jobs per ``group_id`` may be active at once.
+
+    The '<=' in ``start_after <= now()`` is deliberate: on CockroachDB now()
+    can equal a just-inserted job's start_after, so a strict '<' would miss a
+    job claimed in the same instant as send() (what notify_worker triggers).
     """
     columns = _JOB_COLUMNS_MIN + (_JOB_COLUMNS_META if include_metadata else ())
     returning = ", ".join(f"j.{column}" for column in columns)
-    return f"""
+    if group_concurrency is None:
+        return f"""
     WITH next AS (
       SELECT j.id
       FROM {schema}.job j
       WHERE j.name = $1
         AND j.state < 'active'
-        -- '<=', not '<': on CockroachDB now() can equal a just-inserted job's
-        -- start_after, so a strict '<' would miss a job claimed in the same
-        -- instant as send() (exactly what notify_worker triggers).
         AND j.start_after <= now()
       ORDER BY j.priority DESC, j.created_on, j.id
       LIMIT $2
@@ -131,6 +136,47 @@ def fetch_next_job(schema: str, *, include_metadata: bool = False) -> str:
                          THEN j.retry_count + 1 ELSE j.retry_count END
     FROM next
     WHERE j.name = $1 AND j.id = next.id
+    RETURNING {returning}
+    """
+    # group-concurrency path: only claim jobs whose group is below the $3 cap.
+    return f"""
+    WITH active_group_counts AS (
+      SELECT group_id, COUNT(*)::int AS active_cnt
+      FROM {schema}.job
+      WHERE name = $1 AND state = 'active' AND group_id IS NOT NULL
+      GROUP BY group_id
+    ),
+    next AS (
+      SELECT j.id, j.group_id
+      FROM {schema}.job j
+      LEFT JOIN active_group_counts agc ON j.group_id = agc.group_id
+      WHERE j.name = $1
+        AND j.state < 'active'
+        AND j.start_after <= now()
+        AND (j.group_id IS NULL OR agc.active_cnt IS NULL OR agc.active_cnt < $3)
+      ORDER BY j.priority DESC, j.created_on, j.id
+      LIMIT $2
+      FOR UPDATE OF j SKIP LOCKED
+    ),
+    group_ranking AS (
+      SELECT t.id, t.group_id,
+        ROW_NUMBER() OVER (PARTITION BY t.group_id ORDER BY t.id) AS group_rn,
+        COALESCE(agc.active_cnt, 0) AS active_cnt
+      FROM next t
+      LEFT JOIN active_group_counts agc ON t.group_id = agc.group_id
+    ),
+    group_filtered AS (
+      SELECT id FROM group_ranking
+      WHERE group_id IS NULL OR (active_cnt + group_rn) <= $3
+    )
+    UPDATE {schema}.job j SET
+      state = 'active',
+      started_on = now(),
+      heartbeat_on = now(),
+      retry_count = CASE WHEN j.started_on IS NOT NULL
+                         THEN j.retry_count + 1 ELSE j.retry_count END
+    FROM group_filtered
+    WHERE j.name = $1 AND j.id = group_filtered.id
     RETURNING {returning}
     """
 

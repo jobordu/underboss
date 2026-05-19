@@ -20,6 +20,10 @@ _log = logging.getLogger("underboss.worker")
 #: resolved that job's write intent, so FOR UPDATE SKIP LOCKED skipped it.
 _NOTIFY_RETRY_SECONDS = 0.05
 
+#: How many fast retries a notify grants before the worker falls back to its
+#: normal poll interval — covers a slow write-intent resolution under load.
+_NOTIFY_RETRIES = 10
+
 
 def _row_to_job(row: Any, *, include_metadata: bool) -> Job:
     """Build a :class:`Job` from a fetched row."""
@@ -68,7 +72,16 @@ class Worker:
         self._schema = schema
         self._handler = handler
         self._options = options
-        self._fetch_sql = sql.fetch_next_job(schema, include_metadata=options.include_metadata)
+        self._fetch_sql = sql.fetch_next_job(
+            schema,
+            include_metadata=options.include_metadata,
+            group_concurrency=options.group_concurrency,
+        )
+        _gc = options.group_concurrency
+        if _gc is None:
+            self._fetch_args: tuple[Any, ...] = (name, options.batch_size)
+        else:
+            self._fetch_args = (name, options.batch_size, _gc)
         self._complete_sql = sql.complete_jobs(schema)
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
@@ -104,21 +117,29 @@ class Worker:
 
     async def _run(self) -> None:
         poll = self._options.poll_interval_seconds
+        fast_retries = 0
         while not self._stopping.is_set():
-            notified = self._wake.is_set()
+            if self._wake.is_set():
+                fast_retries = _NOTIFY_RETRIES
             self._wake.clear()
             try:
-                rows = await self._db.fetch(self._fetch_sql, self.name, self._options.batch_size)
+                rows = await self._db.fetch(self._fetch_sql, *self._fetch_args)
             except Exception:
                 _log.exception("underboss worker for %r: fetch failed", self.name)
                 await self._idle(poll)
                 continue
             if not rows:
-                # An empty fetch right after a notify usually means the just-
-                # enqueued job's write intent is not resolved yet (SKIP LOCKED
-                # skipped it) — retry soon instead of waiting a full poll.
-                await self._idle(min(poll, _NOTIFY_RETRY_SECONDS) if notified else poll)
+                # An empty fetch after a notify usually means the just-enqueued
+                # job's write intent is not resolved yet (SKIP LOCKED skipped it
+                # on CockroachDB) — fast-retry a bounded number of times before
+                # falling back to the normal poll interval.
+                if fast_retries > 0:
+                    fast_retries -= 1
+                    await self._idle(min(poll, _NOTIFY_RETRY_SECONDS))
+                else:
+                    await self._idle(poll)
                 continue
+            fast_retries = 0
             await self._process(rows)
 
     async def _process(self, rows: list[Any]) -> None:
