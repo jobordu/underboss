@@ -241,6 +241,13 @@ class Underboss:
         if worker is not None:
             await worker.stop()
 
+    def notify_worker(self, worker_id: str) -> None:
+        """Nudge a worker to poll immediately instead of waiting for its next tick."""
+        self._require_started()
+        worker = self._workers.get(worker_id)
+        if worker is not None:
+            worker.notify()
+
     async def schedule(
         self,
         name: str,

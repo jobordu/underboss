@@ -115,7 +115,10 @@ def fetch_next_job(schema: str, *, include_metadata: bool = False) -> str:
       FROM {schema}.job j
       WHERE j.name = $1
         AND j.state < 'active'
-        AND j.start_after < now()
+        -- '<=', not '<': on CockroachDB now() can equal a just-inserted job's
+        -- start_after, so a strict '<' would miss a job claimed in the same
+        -- instant as send() (exactly what notify_worker triggers).
+        AND j.start_after <= now()
       ORDER BY j.priority DESC, j.created_on, j.id
       LIMIT $2
       FOR UPDATE OF j SKIP LOCKED

@@ -15,6 +15,11 @@ from underboss.types import Job, JobState, WorkHandler, WorkOptions
 
 _log = logging.getLogger("underboss.worker")
 
+#: After a notify(), an empty fetch is retried this soon. A notify means a job
+#: was just enqueued; an empty result usually means CockroachDB has not yet
+#: resolved that job's write intent, so FOR UPDATE SKIP LOCKED skipped it.
+_NOTIFY_RETRY_SECONDS = 0.05
+
 
 def _row_to_job(row: Any, *, include_metadata: bool) -> Job:
     """Build a :class:`Job` from a fetched row."""
@@ -67,6 +72,7 @@ class Worker:
         self._fail_sql = sql.fail_jobs(schema)
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._wake = asyncio.Event()
 
     def start(self) -> None:
         """Spawn the poll loop as a background task."""
@@ -77,6 +83,7 @@ class Worker:
     async def stop(self, *, timeout: float = 30.0) -> None:
         """Signal the poll loop to stop and wait for the in-flight batch to finish."""
         self._stopping.set()
+        self._wake.set()
         task = self._task
         if task is None:
             return
@@ -87,9 +94,19 @@ class Worker:
             await task
         self._task = None
 
+    def notify(self) -> None:
+        """Wake the poll loop so it fetches immediately, skipping the poll delay.
+
+        Ported from pg-boss's ``worker.notify()`` — an in-process nudge so a job
+        sent in this process is picked up without waiting for the next tick.
+        """
+        self._wake.set()
+
     async def _run(self) -> None:
         poll = self._options.poll_interval_seconds
         while not self._stopping.is_set():
+            notified = self._wake.is_set()
+            self._wake.clear()
             try:
                 rows = await self._db.fetch(self._fetch_sql, self.name, self._options.batch_size)
             except Exception:
@@ -97,7 +114,10 @@ class Worker:
                 await self._idle(poll)
                 continue
             if not rows:
-                await self._idle(poll)
+                # An empty fetch right after a notify usually means the just-
+                # enqueued job's write intent is not resolved yet (SKIP LOCKED
+                # skipped it) — retry soon instead of waiting a full poll.
+                await self._idle(min(poll, _NOTIFY_RETRY_SECONDS) if notified else poll)
                 continue
             await self._process(rows)
 
@@ -122,6 +142,10 @@ class Worker:
             _log.exception("underboss worker for %r: settling batch failed", self.name)
 
     async def _idle(self, seconds: float) -> None:
-        """Sleep up to ``seconds``, waking early if a stop was requested."""
+        """Sleep up to ``seconds``, waking early on a stop or a notify().
+
+        Both :meth:`notify` and :meth:`stop` set ``_wake``; the poll loop clears
+        it at the top of each iteration.
+        """
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._stopping.wait(), timeout=seconds)
+            await asyncio.wait_for(self._wake.wait(), timeout=seconds)

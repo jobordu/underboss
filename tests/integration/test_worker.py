@@ -58,3 +58,20 @@ async def test_worker_retries_then_fails(boss: Underboss) -> None:
 
     await _await_state(boss, job_id, "failed")
     assert attempts == 2
+
+
+async def test_notify_worker_wakes_an_idle_worker(boss: Underboss) -> None:
+    await boss.create_queue("mail")
+    done = asyncio.Event()
+
+    async def handler(jobs):
+        done.set()
+
+    # A 30s poll interval — without a notify the job would wait ~30s.
+    worker_id = await boss.work("mail", handler, WorkOptions(poll_interval_seconds=30.0))
+    await asyncio.sleep(0.5)  # let the worker make its first (empty) poll and go idle
+    await boss.send("mail", {"x": 1})
+    boss.notify_worker(worker_id)
+
+    # notify() must wake the worker far sooner than its 30s poll interval.
+    await asyncio.wait_for(done.wait(), timeout=5.0)
