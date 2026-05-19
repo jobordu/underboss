@@ -25,3 +25,17 @@ def test_insert_jobs_uses_bind_params_and_schema() -> None:
 def test_insert_jobs_never_interpolates_names() -> None:
     # With schema "pgboss", nothing should leak the default schema name.
     assert "underboss" not in sql.insert_jobs("pgboss")
+
+
+def test_fail_expired_jobs_targets_active_jobs_past_their_lease() -> None:
+    query = sql.fail_expired_jobs("underboss")
+    assert "UPDATE underboss.job" in query
+    assert "state = 'active'" in query
+    assert "started_on + expire_seconds" in query
+
+
+def test_delete_old_jobs_removes_completed_and_stale_jobs() -> None:
+    query = sql.delete_old_jobs("underboss")
+    assert query.strip().startswith("DELETE FROM underboss.job")
+    assert "deletion_seconds" in query
+    assert "keep_until" in query

@@ -141,22 +141,17 @@ def complete_jobs(schema: str) -> str:
     """
 
 
-def fail_jobs(schema: str) -> str:
-    """Fail active jobs ($1 = queue, $2 = uuid[], $3 = error output jsonb).
+def _retry_or_fail_set(schema: str, output: str) -> str:
+    """The shared SET clause for failing a job — retry with backoff, or fail.
 
     A job with retries remaining moves back to ``retry`` with its next
     ``start_after`` computed from ``retry_delay`` / ``retry_backoff``; an
     exhausted job moves to ``failed``. ``retry_count`` is incremented at claim
-    time by :func:`fetch_next_job`, not here.
-
-    This is a plain UPDATE rather than pg-boss's delete-and-reinsert: that
-    pattern exists for table partitioning and dead-letter copying, neither of
-    which the single-table schema needs (dead-letter routing lands separately).
-    Numeric operands are cast to float8 explicitly — CockroachDB will not mix
-    float and int implicitly the way PostgreSQL does.
+    time by :func:`fetch_next_job`, not here. ``output`` is the SQL expression
+    stored as the job's output. Numeric operands are cast to float8 explicitly —
+    CockroachDB will not mix float and int the way PostgreSQL does.
     """
     return f"""
-    UPDATE {schema}.job SET
       state = CASE WHEN retry_count < retry_limit
                    THEN 'retry'::{schema}.job_state
                    ELSE 'failed'::{schema}.job_state END,
@@ -172,9 +167,53 @@ def fail_jobs(schema: str) -> str:
         ))::int8 * interval '1 second')
       END,
       completed_on = CASE WHEN retry_count < retry_limit THEN NULL ELSE now() END,
-      output = $3::jsonb,
+      output = {output},
       heartbeat_on = NULL
+    """
+
+
+def fail_jobs(schema: str) -> str:
+    """Fail active jobs by id ($1 = queue, $2 = uuid[], $3 = error output jsonb).
+
+    A plain UPDATE rather than pg-boss's delete-and-reinsert: that pattern
+    exists for table partitioning and dead-letter copying, neither of which the
+    single-table schema needs (dead-letter routing lands separately).
+    """
+    set_clause = _retry_or_fail_set(schema, "$3::jsonb")
+    return f"""
+    UPDATE {schema}.job SET
+    {set_clause}
     WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'active'
+    """
+
+
+def fail_expired_jobs(schema: str) -> str:
+    """Fail every active job whose lease has expired (started_on + expire_seconds).
+
+    The timeout sweep — how jobs are recovered from a worker that died mid-run.
+    Like :func:`fail_jobs`, an expired job with retries left returns to
+    ``retry``; an exhausted one moves to ``failed``.
+    """
+    timed_out = "'{\"message\": \"job timed out\"}'::jsonb"
+    set_clause = _retry_or_fail_set(schema, timed_out)
+    return f"""
+    UPDATE {schema}.job SET
+    {set_clause}
+    WHERE state = 'active'
+      AND started_on + expire_seconds * interval '1 second' < now()
+    """
+
+
+def delete_old_jobs(schema: str) -> str:
+    """Delete jobs past their retention window (ported from pg-boss ``deletion``).
+
+    Removes completed jobs older than ``deletion_seconds`` and queued jobs
+    (created/retry) past ``keep_until``.
+    """
+    return f"""
+    DELETE FROM {schema}.job
+    WHERE (deletion_seconds > 0 AND completed_on + deletion_seconds * interval '1 second' < now())
+       OR (state < 'active' AND keep_until < now())
     """
 
 
