@@ -161,9 +161,13 @@ def _job_table_format_function(schema: str) -> str:
 
 
 def _job_table_run_async_function(schema: str) -> str:
+    # CockroachDB v23.2 rejects DEFAULT values on function arguments
+    # (crdb #100962), so the arguments are plain. underboss never calls this
+    # function — build_schema installs job_i7 directly — it exists only for
+    # wire-compatibility with pg-boss schema v30; the arity is preserved.
     return f"""CREATE FUNCTION {schema}.job_table_run_async(
       command_name text, version int, command text,
-      tbl_name text DEFAULT NULL, queue_name text DEFAULT NULL)
+      tbl_name text, queue_name text)
     RETURNS VOID AS
     $$
       INSERT INTO {schema}.bam (name, version, status, queue, table_name, command)
