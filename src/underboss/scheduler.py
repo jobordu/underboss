@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
@@ -77,7 +78,7 @@ class Scheduler:
     async def start(self) -> None:
         """Create the send-it queue, start its worker, and begin ticking."""
         await self._db.execute(
-            sql.create_queue(self._schema), SEND_IT_QUEUE, {"policy": "standard"}
+            sql.create_queue(self._schema), SEND_IT_QUEUE, json.dumps({"policy": "standard"})
         )
         self._worker = Worker(
             self._db,

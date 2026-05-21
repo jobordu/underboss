@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import TracebackType
@@ -268,7 +269,7 @@ class Underboss:
         self._require_started()
         payload = _queue_options_payload(options or QueueOptions())
         await self._db.execute(
-            sql.create_queue(self._schema), name, payload, connection=connection
+            sql.create_queue(self._schema), name, json.dumps(payload), connection=connection
         )
 
     async def send(
@@ -289,8 +290,11 @@ class Underboss:
         payload = _job_payload(data, options or SendOptions())
         # fetch (not fetchrow): fetchrow leaves a row-limited suspended portal,
         # which CockroachDB rejects inside a transaction (crdb issue #40195).
+        # The payload is JSON-encoded here (not by a per-connection jsonb codec),
+        # so `connection` may be any asyncpg connection — including one owned by
+        # SQLAlchemy — not only one from underboss's own pool.
         rows = await self._db.fetch(
-            sql.insert_jobs(self._schema), [payload], name, connection=connection
+            sql.insert_jobs(self._schema), json.dumps([payload]), name, connection=connection
         )
         return str(rows[0]["id"]) if rows else None
 
@@ -356,7 +360,7 @@ class Underboss:
         self._require_started()
         payloads = [_job_insert_payload(job) for job in jobs]
         rows = await self._db.fetch(
-            sql.insert_jobs(self._schema), payloads, name, connection=connection
+            sql.insert_jobs(self._schema), json.dumps(payloads), name, connection=connection
         )
         return [str(row["id"]) for row in rows]
 
@@ -395,27 +399,34 @@ class Underboss:
     ) -> None:
         """Mark a job completed."""
         self._require_started()
-        await self._db.execute(sql.complete_jobs(self._schema), name, [job_id], output)
+        # ids and output are bound as JSON text — see sql.complete_jobs.
+        await self._db.execute(
+            sql.complete_jobs(self._schema),
+            name,
+            json.dumps([job_id]),
+            json.dumps(output) if output is not None else None,
+        )
 
     async def cancel(self, name: str, job_id: str) -> None:
         """Cancel a queued or active job."""
         self._require_started()
-        await self._db.execute(sql.cancel_jobs(self._schema), name, [job_id])
+        # The id array is bound as JSON text — see sql.complete_jobs.
+        await self._db.execute(sql.cancel_jobs(self._schema), name, json.dumps([job_id]))
 
     async def resume(self, name: str, job_id: str) -> None:
         """Return a cancelled job to its queue."""
         self._require_started()
-        await self._db.execute(sql.resume_jobs(self._schema), name, [job_id])
+        await self._db.execute(sql.resume_jobs(self._schema), name, json.dumps([job_id]))
 
     async def retry(self, name: str, job_id: str) -> None:
         """Re-queue a failed job."""
         self._require_started()
-        await self._db.execute(sql.retry_jobs(self._schema), name, [job_id])
+        await self._db.execute(sql.retry_jobs(self._schema), name, json.dumps([job_id]))
 
     async def delete_job(self, name: str, job_id: str) -> None:
         """Delete a job by id."""
         self._require_started()
-        await self._db.execute(sql.delete_jobs(self._schema), name, [job_id])
+        await self._db.execute(sql.delete_jobs(self._schema), name, json.dumps([job_id]))
 
     async def get_queue(self, name: str) -> Queue | None:
         """Return a queue's configuration, or ``None`` if it does not exist."""

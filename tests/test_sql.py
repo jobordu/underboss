@@ -6,7 +6,7 @@ from underboss import sql
 
 
 def test_create_queue_targets_the_schema_function() -> None:
-    assert sql.create_queue("underboss") == "SELECT underboss.create_queue($1, $2::jsonb)"
+    assert sql.create_queue("underboss") == "SELECT underboss.create_queue($1, $2::text::jsonb)"
 
 
 def test_delete_queue_targets_the_schema_function() -> None:
@@ -17,7 +17,7 @@ def test_insert_jobs_uses_bind_params_and_schema() -> None:
     query = sql.insert_jobs("pgboss")
     assert "INSERT INTO pgboss.job" in query
     assert "JOIN pgboss.queue q ON q.name = $2" in query
-    assert "jsonb_array_elements($1::jsonb)" in query
+    assert "jsonb_array_elements($1::text::jsonb)" in query
     assert "ON CONFLICT DO NOTHING" in query
     assert "RETURNING id" in query
 
@@ -68,6 +68,6 @@ def test_admin_sql_builders_target_the_schema() -> None:
     assert "state = 'cancelled'" in sql.cancel_jobs("underboss")
     assert "state = 'created'" in sql.resume_jobs("underboss")
     assert "retry_limit = retry_limit + 1" in sql.retry_jobs("underboss")
-    assert sql.delete_jobs("underboss").startswith("DELETE FROM underboss.job")
+    assert sql.delete_jobs("underboss").strip().startswith("DELETE FROM underboss.job")
     assert "FROM underboss.queue WHERE name = $1" in sql.get_queue("underboss")
     assert "FROM underboss.queue ORDER BY name" in sql.get_queues("underboss")

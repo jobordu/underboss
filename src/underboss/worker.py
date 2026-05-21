@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -155,8 +156,11 @@ class Worker:
             await self._complete(ids, output)
 
     async def _complete(self, ids: list[Any], output: Any) -> None:
+        # ids and output are bound as JSON text — see sql.complete_jobs.
+        id_json = json.dumps([str(i) for i in ids])
+        payload = json.dumps(output) if output is not None else None
         try:
-            await self._db.execute(self._complete_sql, self.name, ids, output)
+            await self._db.execute(self._complete_sql, self.name, id_json, payload)
         except Exception:
             _log.exception("underboss worker for %r: completing batch failed", self.name)
 

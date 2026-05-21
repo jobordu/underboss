@@ -7,6 +7,7 @@ one transaction — atomic, but each touching ``job`` only once.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from underboss import sql
@@ -26,7 +27,13 @@ async def fail_by_id(
 ) -> None:
     """Fail jobs by id, routing any that exhaust their retries to their DLQ."""
     async with db.transaction() as conn:
-        rows = await conn.fetch(sql.fail_jobs(schema), name, ids, output)
+        # ids and output are bound as JSON text — see sql.complete_jobs.
+        rows = await conn.fetch(
+            sql.fail_jobs(schema),
+            name,
+            json.dumps([str(i) for i in ids]),
+            json.dumps(output),
+        )
         await _route(conn, schema, rows)
 
 

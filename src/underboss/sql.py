@@ -8,8 +8,13 @@ from __future__ import annotations
 
 
 def create_queue(schema: str) -> str:
-    """Create a queue via the ``create_queue`` function ($1 = name, $2 = options)."""
-    return f"SELECT {schema}.create_queue($1, $2::jsonb)"
+    """Create a queue via the ``create_queue`` function ($1 = name, $2 = options).
+
+    ``$2`` is bound as JSON text and cast (``::text::jsonb``), not bound as jsonb
+    directly, so the call needs no per-connection jsonb codec and can run on a
+    caller-supplied connection.
+    """
+    return f"SELECT {schema}.create_queue($1, $2::text::jsonb)"
 
 
 def delete_queue(schema: str) -> str:
@@ -18,11 +23,15 @@ def delete_queue(schema: str) -> str:
 
 
 def insert_jobs(schema: str) -> str:
-    """Insert a batch of jobs ($1 = jsonb array of job specs, $2 = queue name).
+    """Insert a batch of jobs ($1 = JSON-text array of job specs, $2 = queue name).
 
     Ported from pg-boss ``insertJobs``. Per-job options fall back to the queue's
     defaults via the join on ``queue``; ``ON CONFLICT DO NOTHING`` lets the
     policy indexes suppress duplicates. Returns the id of each row inserted.
+
+    ``$1`` is bound as JSON text and cast (``::text::jsonb``), not bound as jsonb
+    directly, so the call needs no per-connection jsonb codec and can run on a
+    caller-supplied connection.
     """
     return f"""
     INSERT INTO {schema}.job (
@@ -88,7 +97,7 @@ def insert_jobs(schema: str) -> str:
           THEN CAST(x->>'startAfter' as timestamp with time zone)
           ELSE now() + CAST(COALESCE(x->>'startAfter', '0') as interval)
         END as start_after
-      FROM jsonb_array_elements($1::jsonb) AS x
+      FROM jsonb_array_elements($1::text::jsonb) AS x
     ) j
     JOIN {schema}.queue q ON q.name = $2
     ON CONFLICT DO NOTHING
@@ -182,11 +191,23 @@ def fetch_next_job(
 
 
 def complete_jobs(schema: str) -> str:
-    """Mark active jobs completed ($1 = queue, $2 = uuid[], $3 = output jsonb)."""
+    """Mark active jobs completed ($1 = queue, $2 = JSON-text id array, $3 = output JSON text).
+
+    ``$2`` (the job ids) and ``$3`` (the output) are bound as JSON text and
+    cast (``::text::jsonb``), not as a ``uuid[]`` array / ``jsonb`` directly.
+    asyncpg introspects an unfamiliar array type the first time it prepares a
+    statement that binds one, and on CockroachDB that introspection is
+    pathologically slow — its ``pg_catalog`` emulation makes asyncpg's
+    recursive ``typeinfo_tree`` query take several seconds, stalling the
+    completion UPDATE. Keeping every bind parameter plain text avoids it
+    (and matches the ``::text::jsonb`` convention of insert_jobs/create_queue).
+    """
     return f"""
     UPDATE {schema}.job
-    SET completed_on = now(), state = 'completed', output = $3::jsonb
-    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'active'
+    SET completed_on = now(), state = 'completed', output = $3::text::jsonb
+    WHERE name = $1
+      AND id IN (SELECT e::uuid FROM jsonb_array_elements_text($2::text::jsonb) AS e)
+      AND state = 'active'
     """
 
 
@@ -222,18 +243,23 @@ def _retry_or_fail_set(schema: str, output: str) -> str:
 
 
 def fail_jobs(schema: str) -> str:
-    """Fail active jobs by id ($1 = queue, $2 = uuid[], $3 = error output jsonb).
+    """Fail active jobs by id ($1 = queue, $2 = JSON-text id array, $3 = output JSON text).
 
     Moves each job to ``retry`` or ``failed`` and RETURNs its dead_letter / data
     / output / state, so the caller can route exhausted jobs to a dead-letter
     queue with :func:`route_to_dead_letter` — a separate statement, because
     CockroachDB rejects two mutations of one table in a single statement.
+
+    ``$2`` / ``$3`` are bound as JSON text and cast — see :func:`complete_jobs`
+    for why (asyncpg's array-type introspection is pathologically slow on CRDB).
     """
-    set_clause = _retry_or_fail_set(schema, "$3::jsonb")
+    set_clause = _retry_or_fail_set(schema, "$3::text::jsonb")
     return f"""
     UPDATE {schema}.job SET
     {set_clause}
-    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'active'
+    WHERE name = $1
+      AND id IN (SELECT e::uuid FROM jsonb_array_elements_text($2::text::jsonb) AS e)
+      AND state = 'active'
     RETURNING dead_letter, data, output, state
     """
 
@@ -338,35 +364,45 @@ def get_job_by_id(schema: str) -> str:
 
 
 def cancel_jobs(schema: str) -> str:
-    """Cancel queued or active jobs ($1 = queue, $2 = uuid[])."""
+    """Cancel queued or active jobs ($1 = queue, $2 = JSON-text id array)."""
     return f"""
     UPDATE {schema}.job
     SET completed_on = now(), state = 'cancelled'
-    WHERE name = $1 AND id = ANY($2::uuid[]) AND state < 'completed'
+    WHERE name = $1
+      AND id IN (SELECT e::uuid FROM jsonb_array_elements_text($2::text::jsonb) AS e)
+      AND state < 'completed'
     """
 
 
 def resume_jobs(schema: str) -> str:
-    """Return cancelled jobs to the queue ($1 = queue, $2 = uuid[])."""
+    """Return cancelled jobs to the queue ($1 = queue, $2 = JSON-text id array)."""
     return f"""
     UPDATE {schema}.job
     SET completed_on = NULL, state = 'created'
-    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'cancelled'
+    WHERE name = $1
+      AND id IN (SELECT e::uuid FROM jsonb_array_elements_text($2::text::jsonb) AS e)
+      AND state = 'cancelled'
     """
 
 
 def retry_jobs(schema: str) -> str:
-    """Re-queue failed jobs, lifting their retry limit ($1 = queue, $2 = uuid[])."""
+    """Re-queue failed jobs, lifting their retry limit ($1 = queue, $2 = JSON-text id array)."""
     return f"""
     UPDATE {schema}.job
     SET state = 'retry', retry_limit = retry_limit + 1
-    WHERE name = $1 AND id = ANY($2::uuid[]) AND state = 'failed'
+    WHERE name = $1
+      AND id IN (SELECT e::uuid FROM jsonb_array_elements_text($2::text::jsonb) AS e)
+      AND state = 'failed'
     """
 
 
 def delete_jobs(schema: str) -> str:
-    """Delete jobs by id ($1 = queue, $2 = uuid[])."""
-    return f"DELETE FROM {schema}.job WHERE name = $1 AND id = ANY($2::uuid[])"
+    """Delete jobs by id ($1 = queue, $2 = JSON-text id array)."""
+    return f"""
+    DELETE FROM {schema}.job
+    WHERE name = $1
+      AND id IN (SELECT e::uuid FROM jsonb_array_elements_text($2::text::jsonb) AS e)
+    """
 
 
 _QUEUE_COLUMNS = (
