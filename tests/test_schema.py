@@ -12,7 +12,9 @@ def test_schema_version_matches_pgboss_v12() -> None:
 def test_build_schema_emits_core_objects() -> None:
     sql = "\n".join(schema.build_schema("underboss", schema.SCHEMA_VERSION))
     assert "CREATE SCHEMA IF NOT EXISTS underboss" in sql
-    assert "CREATE TYPE IF NOT EXISTS underboss.job_state AS ENUM" in sql
+    # CREATE TYPE has no portable IF NOT EXISTS — wrapped in DO/EXCEPTION instead.
+    assert "CREATE TYPE underboss.job_state AS ENUM" in sql
+    assert "EXCEPTION WHEN duplicate_object THEN NULL" in sql
     assert "CREATE TABLE IF NOT EXISTS underboss.job" in sql
     assert "CREATE TABLE IF NOT EXISTS underboss.queue" in sql
     assert "CREATE TABLE IF NOT EXISTS underboss.schedule" in sql
@@ -50,7 +52,14 @@ def test_build_schema_is_fully_idempotent_on_text_level() -> None:
     """
     for stmt in schema.build_schema("underboss"):
         s = " ".join(stmt.split())  # collapse whitespace
-        is_idempotent = "IF NOT EXISTS" in s or "CREATE OR REPLACE" in s or "ON CONFLICT" in s
+        is_idempotent = (
+            "IF NOT EXISTS" in s
+            or "CREATE OR REPLACE" in s
+            or "ON CONFLICT" in s
+            # DO/EXCEPTION wrapper around CREATE TYPE — portable PG+CRDB form,
+            # since standard Postgres has no `CREATE TYPE IF NOT EXISTS`.
+            or ("DO $$" in s and "EXCEPTION WHEN duplicate_object" in s)
+        )
         assert is_idempotent, f"non-idempotent DDL would break partial-state retries:\n{stmt}"
 
 

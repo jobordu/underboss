@@ -1,8 +1,11 @@
 """Portable DDL for the underboss schema.
 
 A faithful port of pg-boss v12's schema (the ``create()`` plan in pg-boss's
-``plans.ts``), kept deliberately free of PL/pgSQL and Postgres extensions so the
-exact same DDL runs unmodified on both PostgreSQL and CockroachDB.
+``plans.ts``), kept deliberately minimal on PL/pgSQL and Postgres extensions
+so the exact same DDL runs unmodified on both PostgreSQL and CockroachDB.
+The only PL/pgSQL is a single ``DO/EXCEPTION`` wrapper around ``CREATE TYPE``
+(standard Postgres has no ``IF NOT EXISTS`` form for ``CREATE TYPE``; the
+wrapper is the portable idempotency mechanism).
 
 The layout is wire-compatible with pg-boss schema version 30 (pg-boss 12.18.1).
 underboss is a Python port of pg-boss (https://github.com/timgit/pg-boss), MIT.
@@ -64,8 +67,17 @@ def _create_schema(schema: str) -> str:
 
 
 def _create_enum_job_state(schema: str) -> str:
-    values = ",\n      ".join(f"'{state}'" for state in JOB_STATES)
-    return f"CREATE TYPE IF NOT EXISTS {schema}.job_state AS ENUM (\n      {values}\n    )"
+    values = ",\n        ".join(f"'{state}'" for state in JOB_STATES)
+    # CREATE TYPE IF NOT EXISTS is a CockroachDB extension; standard Postgres
+    # has no such form. The DO/EXCEPTION wrapper is portable to both engines
+    # and catches the duplicate_object SQLSTATE that fires on re-install — it
+    # is the only minimal use of PL/pgSQL in this module.
+    return f"""DO $$ BEGIN
+      CREATE TYPE {schema}.job_state AS ENUM (
+        {values}
+      );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$"""
 
 
 def _create_table_version(schema: str) -> str:
