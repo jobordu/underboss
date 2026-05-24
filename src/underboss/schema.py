@@ -65,11 +65,11 @@ def _create_schema(schema: str) -> str:
 
 def _create_enum_job_state(schema: str) -> str:
     values = ",\n      ".join(f"'{state}'" for state in JOB_STATES)
-    return f"CREATE TYPE {schema}.job_state AS ENUM (\n      {values}\n    )"
+    return f"CREATE TYPE IF NOT EXISTS {schema}.job_state AS ENUM (\n      {values}\n    )"
 
 
 def _create_table_version(schema: str) -> str:
-    return f"""CREATE TABLE {schema}.version (
+    return f"""CREATE TABLE IF NOT EXISTS {schema}.version (
       version int primary key,
       cron_on timestamp with time zone,
       bam_on timestamp with time zone
@@ -77,7 +77,7 @@ def _create_table_version(schema: str) -> str:
 
 
 def _create_table_queue(schema: str) -> str:
-    return f"""CREATE TABLE {schema}.queue (
+    return f"""CREATE TABLE IF NOT EXISTS {schema}.queue (
       name text NOT NULL,
       policy text NOT NULL,
       retry_limit int NOT NULL,
@@ -106,7 +106,7 @@ def _create_table_queue(schema: str) -> str:
 
 
 def _create_table_schedule(schema: str) -> str:
-    return f"""CREATE TABLE {schema}.schedule (
+    return f"""CREATE TABLE IF NOT EXISTS {schema}.schedule (
       name text REFERENCES {schema}.queue ON DELETE CASCADE,
       key text not null DEFAULT '',
       cron text not null,
@@ -120,7 +120,7 @@ def _create_table_schedule(schema: str) -> str:
 
 
 def _create_table_subscription(schema: str) -> str:
-    return f"""CREATE TABLE {schema}.subscription (
+    return f"""CREATE TABLE IF NOT EXISTS {schema}.subscription (
       event text not null,
       name text not null REFERENCES {schema}.queue ON DELETE CASCADE,
       created_on timestamp with time zone not null default now(),
@@ -130,7 +130,7 @@ def _create_table_subscription(schema: str) -> str:
 
 
 def _create_table_bam(schema: str) -> str:
-    return f"""CREATE TABLE {schema}.bam (
+    return f"""CREATE TABLE IF NOT EXISTS {schema}.bam (
       id uuid PRIMARY KEY default gen_random_uuid(),
       name text NOT NULL,
       version int NOT NULL,
@@ -146,7 +146,7 @@ def _create_table_bam(schema: str) -> str:
 
 
 def _job_table_format_function(schema: str) -> str:
-    return f"""CREATE FUNCTION {schema}.job_table_format(command text, table_name text)
+    return f"""CREATE OR REPLACE FUNCTION {schema}.job_table_format(command text, table_name text)
     RETURNS text AS
     $$
       SELECT format(
@@ -165,7 +165,7 @@ def _job_table_run_async_function(schema: str) -> str:
     # (crdb #100962), so the arguments are plain. underboss never calls this
     # function — build_schema installs job_i7 directly — it exists only for
     # wire-compatibility with pg-boss schema v30; the arity is preserved.
-    return f"""CREATE FUNCTION {schema}.job_table_run_async(
+    return f"""CREATE OR REPLACE FUNCTION {schema}.job_table_run_async(
       command_name text, version int, command text,
       tbl_name text, queue_name text)
     RETURNS VOID AS
@@ -177,7 +177,14 @@ def _job_table_run_async_function(schema: str) -> str:
 
 
 def _create_table_job(schema: str) -> str:
-    return f"""CREATE TABLE {schema}.job (
+    # FKs (q_fkey, dlq_fkey) and the key_strict_fifo CHECK are inlined here
+    # rather than emitted as separate ALTER TABLE statements: CockroachDB
+    # has no `ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS` (crdb #29657),
+    # so making the schema-install idempotent requires the constraints to
+    # live on the CREATE TABLE itself (which IS guarded by IF NOT EXISTS).
+    # Constraint names are preserved so existing pg-boss-shape tooling sees
+    # the same names.
+    return f"""CREATE TABLE IF NOT EXISTS {schema}.job (
       id uuid not null default gen_random_uuid(),
       name text not null,
       priority integer not null default(0),
@@ -204,69 +211,57 @@ def _create_table_job(schema: str) -> str:
       policy text,
       heartbeat_on timestamp with time zone,
       heartbeat_seconds int,
+      CONSTRAINT q_fkey FOREIGN KEY (name) REFERENCES {schema}.queue (name) ON DELETE RESTRICT,
+      CONSTRAINT dlq_fkey FOREIGN KEY (dead_letter) REFERENCES {schema}.queue (name) ON DELETE RESTRICT,
+      CONSTRAINT job_key_strict_fifo_singleton_key_check CHECK (
+        NOT (policy = 'key_strict_fifo' AND singleton_key IS NULL)
+      ),
       PRIMARY KEY (name, id)
     )"""
 
 
-def _fk_job_queue(schema: str) -> str:
-    return (
-        f"ALTER TABLE {schema}.job ADD CONSTRAINT q_fkey "
-        f"FOREIGN KEY (name) REFERENCES {schema}.queue (name) ON DELETE RESTRICT"
-    )
-
-
-def _fk_job_dead_letter(schema: str) -> str:
-    return (
-        f"ALTER TABLE {schema}.job ADD CONSTRAINT dlq_fkey "
-        f"FOREIGN KEY (dead_letter) REFERENCES {schema}.queue (name) ON DELETE RESTRICT"
-    )
-
-
 def _index_job_policy_short(schema: str) -> str:
     return (
-        f"CREATE UNIQUE INDEX job_i1 ON {schema}.job (name, COALESCE(singleton_key, '')) "
+        f"CREATE UNIQUE INDEX IF NOT EXISTS job_i1 ON {schema}.job "
+        f"(name, COALESCE(singleton_key, '')) "
         f"WHERE state = 'created' AND policy = 'short'"
     )
 
 
 def _index_job_policy_singleton(schema: str) -> str:
     return (
-        f"CREATE UNIQUE INDEX job_i2 ON {schema}.job (name, COALESCE(singleton_key, '')) "
+        f"CREATE UNIQUE INDEX IF NOT EXISTS job_i2 ON {schema}.job "
+        f"(name, COALESCE(singleton_key, '')) "
         f"WHERE state = 'active' AND policy = 'singleton'"
     )
 
 
 def _index_job_policy_stately(schema: str) -> str:
     return (
-        f"CREATE UNIQUE INDEX job_i3 ON {schema}.job (name, state, COALESCE(singleton_key, '')) "
+        f"CREATE UNIQUE INDEX IF NOT EXISTS job_i3 ON {schema}.job "
+        f"(name, state, COALESCE(singleton_key, '')) "
         f"WHERE state <= 'active' AND policy = 'stately'"
     )
 
 
 def _index_job_policy_exclusive(schema: str) -> str:
     return (
-        f"CREATE UNIQUE INDEX job_i6 ON {schema}.job (name, COALESCE(singleton_key, '')) "
+        f"CREATE UNIQUE INDEX IF NOT EXISTS job_i6 ON {schema}.job "
+        f"(name, COALESCE(singleton_key, '')) "
         f"WHERE state <= 'active' AND policy = 'exclusive'"
     )
 
 
 def _index_job_policy_key_strict_fifo(schema: str) -> str:
     return (
-        f"CREATE UNIQUE INDEX job_i8 ON {schema}.job (name, singleton_key) "
+        f"CREATE UNIQUE INDEX IF NOT EXISTS job_i8 ON {schema}.job (name, singleton_key) "
         f"WHERE state IN ('active', 'retry', 'failed') AND policy = 'key_strict_fifo'"
-    )
-
-
-def _check_key_strict_fifo(schema: str) -> str:
-    return (
-        f"ALTER TABLE {schema}.job ADD CONSTRAINT job_key_strict_fifo_singleton_key_check "
-        f"CHECK (NOT (policy = 'key_strict_fifo' AND singleton_key IS NULL))"
     )
 
 
 def _index_job_throttle(schema: str) -> str:
     return (
-        f"CREATE UNIQUE INDEX job_i4 ON {schema}.job "
+        f"CREATE UNIQUE INDEX IF NOT EXISTS job_i4 ON {schema}.job "
         f"(name, singleton_on, COALESCE(singleton_key, '')) "
         f"WHERE state <> 'cancelled' AND singleton_on IS NOT NULL"
     )
@@ -276,20 +271,20 @@ def _index_job_fetch(schema: str) -> str:
     # NOTE: the PK column is intentionally absent from INCLUDE — CockroachDB
     # rejects primary-key columns in a covering INCLUDE clause.
     return (
-        f"CREATE INDEX job_i5 ON {schema}.job (name, start_after) "
+        f"CREATE INDEX IF NOT EXISTS job_i5 ON {schema}.job (name, start_after) "
         f"INCLUDE (priority, created_on) WHERE state < 'active'"
     )
 
 
 def _index_job_group_concurrency(schema: str) -> str:
     return (
-        f"CREATE INDEX job_i7 ON {schema}.job (name, group_id) "
+        f"CREATE INDEX IF NOT EXISTS job_i7 ON {schema}.job (name, group_id) "
         f"WHERE state = 'active' AND group_id IS NOT NULL"
     )
 
 
 def _create_table_warning(schema: str) -> str:
-    return f"""CREATE TABLE {schema}.warning (
+    return f"""CREATE TABLE IF NOT EXISTS {schema}.warning (
       id uuid PRIMARY KEY default gen_random_uuid(),
       type text NOT NULL,
       message text NOT NULL,
@@ -299,7 +294,7 @@ def _create_table_warning(schema: str) -> str:
 
 
 def _index_warning(schema: str) -> str:
-    return f"CREATE INDEX warning_i1 ON {schema}.warning (created_on DESC)"
+    return f"CREATE INDEX IF NOT EXISTS warning_i1 ON {schema}.warning (created_on DESC)"
 
 
 def _create_queue_function(schema: str) -> str:
@@ -343,7 +338,9 @@ def _delete_queue_function(schema: str) -> str:
 
 
 def _insert_version(schema: str, version: int) -> str:
-    return f"INSERT INTO {schema}.version(version) VALUES ('{version}')"
+    # ON CONFLICT DO NOTHING so re-running build_schema() against a partially
+    # or fully installed database is a no-op rather than a PK violation.
+    return f"INSERT INTO {schema}.version(version) VALUES ('{version}') ON CONFLICT DO NOTHING"
 
 
 def build_schema(
@@ -354,12 +351,31 @@ def build_schema(
 ) -> list[str]:
     """Return the ordered DDL statements that install the underboss schema.
 
-    Run the returned statements inside a single transaction (see
-    :meth:`underboss.db.Database.run_script`).
+    Every statement is **idempotent** — re-running on a partially or fully
+    installed schema is a clean no-op rather than a duplicate-object error.
+    This matters most on CockroachDB, whose non-transactional DDL leaves
+    partial state behind when a script fails mid-way: a retry must succeed,
+    not compound the original failure.
+
+    Idempotency mechanism per object class:
+      - ``CREATE TYPE`` / ``TABLE`` / ``INDEX``        → ``IF NOT EXISTS``
+      - ``CREATE FUNCTION``                            → ``CREATE OR REPLACE``
+      - FOREIGN KEY + CHECK constraints on ``job``     → inlined on the
+        guarded ``CREATE TABLE IF NOT EXISTS`` (CRDB has no
+        ``ALTER TABLE … ADD CONSTRAINT IF NOT EXISTS``)
+      - Version row INSERT                             → ``ON CONFLICT DO NOTHING``
+
+    Run inside a single transaction where the dialect supports it (see
+    :meth:`underboss.db.Database.run_script`); CockroachDB will still apply
+    each DDL non-transactionally, but the idempotency above means partial
+    application is recoverable.
     """
     statements: list[str] = []
     if create_namespace:
         statements.append(_create_schema(schema))
+    # FKs (q_fkey, dlq_fkey) and the key_strict_fifo CHECK are no longer
+    # separate ALTER TABLE statements — they're inlined on _create_table_job
+    # because CockroachDB lacks `ADD CONSTRAINT IF NOT EXISTS`.
     statements += [
         _create_enum_job_state(schema),
         _create_table_version(schema),
@@ -370,14 +386,11 @@ def build_schema(
         _job_table_format_function(schema),
         _job_table_run_async_function(schema),
         _create_table_job(schema),
-        _fk_job_queue(schema),
-        _fk_job_dead_letter(schema),
         _index_job_policy_short(schema),
         _index_job_policy_singleton(schema),
         _index_job_policy_stately(schema),
         _index_job_policy_exclusive(schema),
         _index_job_policy_key_strict_fifo(schema),
-        _check_key_strict_fifo(schema),
         _index_job_throttle(schema),
         _index_job_fetch(schema),
         _index_job_group_concurrency(schema),
