@@ -12,9 +12,10 @@ def test_schema_version_matches_pgboss_v12() -> None:
 def test_build_schema_emits_core_objects() -> None:
     sql = "\n".join(schema.build_schema("underboss", schema.SCHEMA_VERSION))
     assert "CREATE SCHEMA IF NOT EXISTS underboss" in sql
-    # CREATE TYPE has no portable IF NOT EXISTS — wrapped in DO/EXCEPTION instead.
+    # CREATE TYPE is bare — neither IF NOT EXISTS nor DO/EXCEPTION is portable
+    # to both standard Postgres and CockroachDB v23.2. The Underboss._provision
+    # caller swallows the duplicate-object error from this single statement.
     assert "CREATE TYPE underboss.job_state AS ENUM" in sql
-    assert "EXCEPTION WHEN duplicate_object THEN NULL" in sql
     assert "CREATE TABLE IF NOT EXISTS underboss.job" in sql
     assert "CREATE TABLE IF NOT EXISTS underboss.queue" in sql
     assert "CREATE TABLE IF NOT EXISTS underboss.schedule" in sql
@@ -52,15 +53,15 @@ def test_build_schema_is_fully_idempotent_on_text_level() -> None:
     """
     for stmt in schema.build_schema("underboss"):
         s = " ".join(stmt.split())  # collapse whitespace
-        is_idempotent = (
-            "IF NOT EXISTS" in s
-            or "CREATE OR REPLACE" in s
-            or "ON CONFLICT" in s
-            # DO/EXCEPTION wrapper around CREATE TYPE — portable PG+CRDB form,
-            # since standard Postgres has no `CREATE TYPE IF NOT EXISTS`.
-            or ("DO $$" in s and "EXCEPTION WHEN duplicate_object" in s)
+        is_idempotent = "IF NOT EXISTS" in s or "CREATE OR REPLACE" in s or "ON CONFLICT" in s
+        # CREATE TYPE underboss.job_state is the lone exception — neither
+        # idempotency form (IF NOT EXISTS / DO EXCEPTION) is portable across
+        # standard Postgres and CockroachDB v23.2. Underboss._provision
+        # swallows the duplicate-object error from this statement.
+        is_create_type = s.startswith("CREATE TYPE underboss.job_state AS ENUM")
+        assert is_idempotent or is_create_type, (
+            f"non-idempotent DDL would break partial-state retries:\n{stmt}"
         )
-        assert is_idempotent, f"non-idempotent DDL would break partial-state retries:\n{stmt}"
 
 
 def test_build_schema_inlines_job_table_constraints_for_crdb() -> None:

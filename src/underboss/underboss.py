@@ -236,10 +236,36 @@ class Underboss:
         await self.stop()
 
     async def _provision(self) -> None:
-        """Install the schema, or verify an existing install is the right version."""
+        """Install the schema, or verify an existing install is the right version.
+
+        Idempotency note: the version table guards full-install detection, but
+        a fresh-looking install may actually be a *partial* one — CRDB's
+        non-transactional DDL leaves earlier statements applied when a script
+        fails mid-way, and a retry must complete the install rather than abort
+        on "already exists".
+
+        Every statement in ``build_schema`` is idempotent at the SQL level
+        except ``CREATE TYPE underboss.job_state`` — neither standard PG nor
+        CRDB v23.2 supports both ``IF NOT EXISTS`` and ``DO/EXCEPTION``
+        portably. The duplicate-object error from that one statement is caught
+        here so the rest of the install can proceed.
+        """
         installed = await self._db.fetchval(ddl.version_table_exists(self._schema))
         if not installed:
-            await self._db.run_script(ddl.build_schema(self._schema, SCHEMA_VERSION))
+            try:
+                await self._db.run_script(ddl.build_schema(self._schema, SCHEMA_VERSION))
+            except asyncpg.exceptions.DuplicateObjectError:
+                # A prior partial install left the ENUM behind. Re-run the
+                # install with that one non-idempotent statement skipped; the
+                # other statements are guarded by IF NOT EXISTS / CREATE OR
+                # REPLACE / ON CONFLICT and are safe to re-execute.
+                await self._db.run_script(
+                    [
+                        s
+                        for s in ddl.build_schema(self._schema, SCHEMA_VERSION)
+                        if not s.startswith(f"CREATE TYPE {self._schema}.job_state")
+                    ]
+                )
             return
         version = await self._db.fetchval(ddl.get_version(self._schema))
         if version is not None and int(version) != SCHEMA_VERSION:

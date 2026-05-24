@@ -1,11 +1,16 @@
 """Portable DDL for the underboss schema.
 
 A faithful port of pg-boss v12's schema (the ``create()`` plan in pg-boss's
-``plans.ts``), kept deliberately minimal on PL/pgSQL and Postgres extensions
-so the exact same DDL runs unmodified on both PostgreSQL and CockroachDB.
-The only PL/pgSQL is a single ``DO/EXCEPTION`` wrapper around ``CREATE TYPE``
-(standard Postgres has no ``IF NOT EXISTS`` form for ``CREATE TYPE``; the
-wrapper is the portable idempotency mechanism).
+``plans.ts``), kept deliberately free of PL/pgSQL and Postgres extensions so
+the exact same DDL runs unmodified on both PostgreSQL and CockroachDB.
+
+Every emitted statement except ``CREATE TYPE underboss.job_state`` is
+idempotent at the SQL level (``IF NOT EXISTS`` / ``CREATE OR REPLACE`` /
+``ON CONFLICT DO NOTHING``). ``CREATE TYPE`` is the lone exception — neither
+portable idempotency form exists across both engines (standard PG has no
+``CREATE TYPE IF NOT EXISTS``; CRDB v23.2 has no ``DO`` blocks). The
+``Underboss._provision`` caller wraps the type install with a duplicate-object
+catch on that single statement.
 
 The layout is wire-compatible with pg-boss schema version 30 (pg-boss 12.18.1).
 underboss is a Python port of pg-boss (https://github.com/timgit/pg-boss), MIT.
@@ -67,17 +72,16 @@ def _create_schema(schema: str) -> str:
 
 
 def _create_enum_job_state(schema: str) -> str:
-    values = ",\n        ".join(f"'{state}'" for state in JOB_STATES)
-    # CREATE TYPE IF NOT EXISTS is a CockroachDB extension; standard Postgres
-    # has no such form. The DO/EXCEPTION wrapper is portable to both engines
-    # and catches the duplicate_object SQLSTATE that fires on re-install — it
-    # is the only minimal use of PL/pgSQL in this module.
-    return f"""DO $$ BEGIN
-      CREATE TYPE {schema}.job_state AS ENUM (
-        {values}
-      );
-    EXCEPTION WHEN duplicate_object THEN NULL;
-    END $$"""
+    values = ",\n      ".join(f"'{state}'" for state in JOB_STATES)
+    # Bare CREATE TYPE — neither portable idempotency form works on both
+    # engines:
+    #   - CREATE TYPE IF NOT EXISTS  → CRDB-only extension (not in standard PG)
+    #   - DO $$ EXCEPTION WHEN duplicate_object  → CRDB v23.2 has no DO blocks
+    #     (added in v24.1)
+    # Caller (Underboss._provision) installs this with a duplicate_object
+    # catch around the single statement — the only DDL in build_schema that
+    # cannot express its own idempotency.
+    return f"CREATE TYPE {schema}.job_state AS ENUM (\n      {values}\n    )"
 
 
 def _create_table_version(schema: str) -> str:
