@@ -211,8 +211,10 @@ def _create_table_job(schema: str) -> str:
       policy text,
       heartbeat_on timestamp with time zone,
       heartbeat_seconds int,
-      CONSTRAINT q_fkey FOREIGN KEY (name) REFERENCES {schema}.queue (name) ON DELETE RESTRICT,
-      CONSTRAINT dlq_fkey FOREIGN KEY (dead_letter) REFERENCES {schema}.queue (name) ON DELETE RESTRICT,
+      CONSTRAINT q_fkey FOREIGN KEY (name)
+        REFERENCES {schema}.queue (name) ON DELETE RESTRICT,
+      CONSTRAINT dlq_fkey FOREIGN KEY (dead_letter)
+        REFERENCES {schema}.queue (name) ON DELETE RESTRICT,
       CONSTRAINT job_key_strict_fifo_singleton_key_check CHECK (
         NOT (policy = 'key_strict_fifo' AND singleton_key IS NULL)
       ),
