@@ -13,13 +13,23 @@ def create_queue(schema: str) -> str:
     ``$2`` is bound as JSON text and cast (``::text::jsonb``), not bound as jsonb
     directly, so the call needs no per-connection jsonb codec and can run on a
     caller-supplied connection.
+
+    The function is called UNqualified (resolved via the connection's
+    ``search_path``, pinned to ``schema`` by :class:`~underboss.db.Database`),
+    NOT as ``{schema}.create_queue``. CockroachDB (≥v24.3) raises a spurious
+    "no USAGE on schema" when a schema-qualified UDF is resolved inside a
+    prepared statement against a freshly-created schema; search_path resolution
+    avoids it. ``schema`` is unused here but kept for signature parity.
     """
-    return f"SELECT {schema}.create_queue($1, $2::text::jsonb)"
+    return "SELECT create_queue($1, $2::text::jsonb)"
 
 
 def delete_queue(schema: str) -> str:
-    """Delete a queue and its jobs via the ``delete_queue`` function ($1 = name)."""
-    return f"SELECT {schema}.delete_queue($1)"
+    """Delete a queue and its jobs via the ``delete_queue`` function ($1 = name).
+
+    Called UNqualified (via search_path) — see :func:`create_queue` for why.
+    """
+    return "SELECT delete_queue($1)"
 
 
 def insert_jobs(schema: str) -> str:
