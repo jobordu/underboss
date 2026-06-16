@@ -5,12 +5,18 @@ from __future__ import annotations
 from underboss import sql
 
 
-def test_create_queue_targets_the_schema_function() -> None:
-    assert sql.create_queue("underboss") == "SELECT underboss.create_queue($1, $2::text::jsonb)"
+def test_create_queue_calls_the_function_unqualified() -> None:
+    # Unqualified — resolved via the connection's search_path (pinned to the
+    # schema by Database). A schema-qualified UDF call inside a prepared
+    # statement trips a spurious CockroachDB "no USAGE on schema" on a freshly
+    # created schema; search_path resolution avoids it. `schema` is accepted for
+    # signature parity but intentionally not interpolated.
+    assert sql.create_queue("underboss") == "SELECT create_queue($1, $2::text::jsonb)"
+    assert sql.create_queue("anything") == "SELECT create_queue($1, $2::text::jsonb)"
 
 
-def test_delete_queue_targets_the_schema_function() -> None:
-    assert sql.delete_queue("pgboss") == "SELECT pgboss.delete_queue($1)"
+def test_delete_queue_calls_the_function_unqualified() -> None:
+    assert sql.delete_queue("pgboss") == "SELECT delete_queue($1)"
 
 
 def test_insert_jobs_uses_bind_params_and_schema() -> None:

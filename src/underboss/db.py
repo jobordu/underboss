@@ -35,6 +35,7 @@ class Database:
         pool: asyncpg.Pool | None = None,
         min_size: int = 2,
         max_size: int = 10,
+        schema: str | None = None,
     ) -> None:
         if dsn is None and pool is None:
             raise ValueError("Database requires either a dsn or an existing pool")
@@ -43,6 +44,15 @@ class Database:
         self._owns_pool = pool is None
         self._min_size = min_size
         self._max_size = max_size
+        # When underboss owns the pool, pin search_path to its schema so the
+        # queue UDFs are called UNqualified (see sql.create_queue/delete_queue).
+        # CockroachDB (≥v24.3) raises a spurious "no USAGE on schema" when a
+        # schema-qualified UDF is resolved inside a *prepared statement* against
+        # a freshly-created schema — but the same call via search_path resolves
+        # fine. Qualified table/type refs are unaffected, so they stay qualified.
+        # If a caller supplies their own pool, they must set search_path to the
+        # underboss schema themselves.
+        self._schema = schema
 
     @property
     def pool(self) -> asyncpg.Pool:
@@ -54,12 +64,14 @@ class Database:
         """Create the connection pool, unless one was supplied or already open."""
         if self._pool is not None:
             return
-        self._pool = await asyncpg.create_pool(
-            self._dsn,
-            min_size=self._min_size,
-            max_size=self._max_size,
-            init=_register_json_codecs,
-        )
+        kwargs: dict[str, Any] = {
+            "min_size": self._min_size,
+            "max_size": self._max_size,
+            "init": _register_json_codecs,
+        }
+        if self._schema:
+            kwargs["server_settings"] = {"search_path": f"{self._schema}, public"}
+        self._pool = await asyncpg.create_pool(self._dsn, **kwargs)
 
     async def close(self) -> None:
         """Close the pool if underboss owns it."""

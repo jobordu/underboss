@@ -176,7 +176,9 @@ class Underboss:
         maintenance_interval_seconds: float = 60.0,
     ) -> None:
         self._schema = schema
-        self._db = Database(dsn, pool=pool, min_size=min_pool_size, max_size=max_pool_size)
+        self._db = Database(
+            dsn, pool=pool, min_size=min_pool_size, max_size=max_pool_size, schema=schema
+        )
         self._workers: dict[str, Worker] = {}
         self._scheduler: Scheduler | None = (
             Scheduler(self._db, schema, self.send, tick_interval_seconds=cron_interval_seconds)
