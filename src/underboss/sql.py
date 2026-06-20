@@ -8,28 +8,56 @@ from __future__ import annotations
 
 
 def create_queue(schema: str) -> str:
-    """Create a queue via the ``create_queue`` function ($1 = name, $2 = options).
+    """Upsert a queue row ($1 = name, $2 = options as JSON text).
 
-    ``$2`` is bound as JSON text and cast (``::text::jsonb``), not bound as jsonb
-    directly, so the call needs no per-connection jsonb codec and can run on a
-    caller-supplied connection.
-
-    The function is called UNqualified (resolved via the connection's
-    ``search_path``, pinned to ``schema`` by :class:`~underboss.db.Database`),
-    NOT as ``{schema}.create_queue``. CockroachDB (≥v24.3) raises a spurious
-    "no USAGE on schema" when a schema-qualified UDF is resolved inside a
-    prepared statement against a freshly-created schema; search_path resolution
-    avoids it. ``schema`` is unused here but kept for signature parity.
+    Inlines the body of the ``{schema}.create_queue`` UDF as direct client SQL
+    against the ``{schema}.queue`` TABLE rather than CALLING the UDF. CockroachDB
+    (≥v24.3) raises a spurious "no USAGE on schema <s>" when a UDF (qualified OR
+    resolved via search_path) is bound inside a *prepared statement* against a
+    freshly-created/recently-changed schema — even though the caller owns the
+    schema. Qualified TABLE refs are NOT affected, so the direct INSERT dodges
+    the bug on every gateway, regardless of who owns the pool. Kept parameterised
+    (no literal interpolation); ``$2`` is bound as JSON text and cast
+    (``::text::jsonb``) so no per-connection jsonb codec is needed.
     """
-    return "SELECT create_queue($1, $2::text::jsonb)"
+    return f"""
+    INSERT INTO {schema}.queue (
+      name, policy, retry_limit, retry_delay, retry_backoff, retry_delay_max,
+      expire_seconds, retention_seconds, deletion_seconds, warning_queued,
+      dead_letter, partition, table_name, heartbeat_seconds
+    )
+    SELECT
+      $1,
+      o->>'policy',
+      COALESCE((o->>'retryLimit')::int, 2),
+      COALESCE((o->>'retryDelay')::int, 0),
+      COALESCE((o->>'retryBackoff')::bool, false),
+      (o->>'retryDelayMax')::int,
+      COALESCE((o->>'expireInSeconds')::int, 900),
+      COALESCE((o->>'retentionSeconds')::int, 1209600),
+      COALESCE((o->>'deleteAfterSeconds')::int, 604800),
+      COALESCE((o->>'warningQueueSize')::int, 0),
+      o->>'deadLetter',
+      false,
+      'job',
+      (o->>'heartbeatSeconds')::int
+    FROM (SELECT $2::text::jsonb AS o) s
+    ON CONFLICT DO NOTHING
+    """
 
 
 def delete_queue(schema: str) -> str:
-    """Delete a queue and its jobs via the ``delete_queue`` function ($1 = name).
+    """Delete a queue and its jobs ($1 = name).
 
-    Called UNqualified (via search_path) — see :func:`create_queue` for why.
+    Inlines the ``{schema}.delete_queue`` UDF body as direct client SQL against
+    the ``{schema}.job`` + ``{schema}.queue`` TABLES (qualified table refs are
+    immune to the spurious prepared-UDF "no USAGE on schema" bug — see
+    :func:`create_queue`). Single statement via a CTE so it stays parameterised.
     """
-    return "SELECT delete_queue($1)"
+    return f"""
+    WITH del_jobs AS (DELETE FROM {schema}.job WHERE name = $1 RETURNING 1)
+    DELETE FROM {schema}.queue WHERE name = $1
+    """
 
 
 def insert_jobs(schema: str) -> str:
