@@ -5,18 +5,26 @@ from __future__ import annotations
 from underboss import sql
 
 
-def test_create_queue_calls_the_function_unqualified() -> None:
-    # Unqualified — resolved via the connection's search_path (pinned to the
-    # schema by Database). A schema-qualified UDF call inside a prepared
-    # statement trips a spurious CockroachDB "no USAGE on schema" on a freshly
-    # created schema; search_path resolution avoids it. `schema` is accepted for
-    # signature parity but intentionally not interpolated.
-    assert sql.create_queue("underboss") == "SELECT create_queue($1, $2::text::jsonb)"
-    assert sql.create_queue("anything") == "SELECT create_queue($1, $2::text::jsonb)"
+def test_create_queue_inserts_into_the_queue_table_directly() -> None:
+    # Inlines the create_queue UDF body as a direct INSERT into the qualified
+    # {schema}.queue TABLE rather than CALLING the UDF. A prepared statement that
+    # binds a UDF (qualified OR via search_path) trips a spurious CockroachDB
+    # "no USAGE on schema" on a freshly-created/recently-changed schema; qualified
+    # table refs are immune, so the direct INSERT dodges it on every gateway.
+    q = sql.create_queue("underboss")
+    assert "INSERT INTO underboss.queue" in q
+    assert "create_queue(" not in q  # no UDF call
+    assert "$2::text::jsonb" in q  # options bound as JSON text, no jsonb codec needed
+    assert "ON CONFLICT DO NOTHING" in q
+    # schema IS interpolated (it names the table), names/options stay bind params.
+    assert "INSERT INTO pgboss.queue" in sql.create_queue("pgboss")
 
 
-def test_delete_queue_calls_the_function_unqualified() -> None:
-    assert sql.delete_queue("pgboss") == "SELECT delete_queue($1)"
+def test_delete_queue_deletes_from_job_and_queue_tables_directly() -> None:
+    q = sql.delete_queue("pgboss")
+    assert "delete_queue(" not in q  # no UDF call
+    assert "DELETE FROM pgboss.job WHERE name = $1" in q
+    assert "DELETE FROM pgboss.queue WHERE name = $1" in q
 
 
 def test_insert_jobs_uses_bind_params_and_schema() -> None:
